@@ -2,102 +2,197 @@ package main
 
 import (
 	"log"
-	"strconv"
-	"strings"
-	"os/exec"
 	"time"
 )
 
 const (
-	healthInterval = 10 * time.Second
-	healthFailures = 2 // 连续失败几次才判定掉线，避免网络抖动误杀
-	healthTimeout  = 6 * time.Second
+	healthInterval     = 5 * time.Second
+	standbyRetryAfter  = 30 * time.Second // 备用隧道创建失败后，等多久再重试
 )
 
-// WatchHealth 周期检查每条隧道是否还能出网，掉线的自动换节点重连。
-// VPN Gate 是志愿者节点，运行中掉线很常见。
-func (m *Manager) WatchHealth() {
-	fails := map[int]int{}
+// WatchHealth 周期检查两条隧道：
+// - 主隧道故障 → 立即切换到备用隧道，然后刷新原主隧道
+// - 备用隧道故障 → 直接刷新备用隧道
+// - 始终保持两条隧道可用
+func (p *TunnelPool) WatchHealth() {
+	// 刚启动时给隧道一些时间建立连接
+	time.Sleep(10 * time.Second)
 
 	for range time.Tick(healthInterval) {
-		for _, t := range m.Tunnels() {
-			if t.Status != "up" {
-				continue
-			}
-			if m.tunnelHealthy(t) {
-				fails[t.Slot] = 0
-				continue
-			}
+		activeOK, standbyOK := p.checkTunnels()
 
-			fails[t.Slot]++
-			if fails[t.Slot] < healthFailures {
-				log.Printf("隧道 %d (%s) 探测失败 %d 次", t.Slot, t.Node.HostName, fails[t.Slot])
-				continue
+		if !activeOK {
+			log.Printf("主隧道故障，正在切换到备用隧道")
+			if p.SwitchToStandby() {
+				// 切换成功，原主隧道（现在是备用）需要刷新
+				oldActive := p.standby // SwitchToStandby 交换了指针
+				go p.refreshFailedTunnel(oldActive)
+			} else {
+				// 备用隧道也不可用，刷新主隧道
+				active := p.active
+				if active != nil {
+					go p.refreshFailedTunnel(active)
+				}
 			}
+			continue
+		}
 
-			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", t.Slot, t.Node.HostName)
-			fails[t.Slot] = 0
-			m.reconnect(t, t.Node.HostName)
+		// 主隧道正常，检查备用隧道
+		if !standbyOK {
+			standby := p.standby
+			if standby != nil {
+				log.Printf("备用隧道 %s 故障，正在刷新", standby.Node.HostName)
+				go p.refreshFailedTunnel(standby)
+			} else if time.Since(p.lastStandbyRetry) >= standbyRetryAfter {
+				// 备用隧道不存在，且距上次重试已超过间隔，重试
+				p.lastStandbyRetry = time.Now()
+				go p.createStandbyTunnel()
+			}
 		}
 	}
 }
 
-// tunnelHealthy 判断隧道是否还真的走在 VPN 上。
-//
-// 只看"能不能出网"是不够的：netns 通过 veth 走母机 NAT，
-// openvpn 死掉后照样能出网，只是出口变回了母机 IP。
-// 所以要比对出口 IP 是否仍是建立隧道时拿到的那个。
-func (m *Manager) tunnelHealthy(t *Tunnel) bool {
-	out, err := exec.Command("ip", "netns", "exec", t.nsName(),
-		"curl", "-s", "--max-time", strconv.Itoa(int(healthTimeout.Seconds())),
-		"http://api.ipify.org").Output()
+// checkTunnels 检查两条隧道的健康状况。
+// - "up" 状态的隧道：通过 curl api.ipify.org 比对出口 IP
+// - "starting" 状态的隧道：正在重建，给 3 分钟宽限，不视为故障
+// - 其他状态（failed/stopped）：判定为故障
+func (p *TunnelPool) checkTunnels() (activeOK, standbyOK bool) {
+	p.mu.RLock()
+	active := p.active
+	standby := p.standby
+	p.mu.RUnlock()
+
+	if active != nil {
+		switch active.Status {
+		case "up":
+			activeOK = active.tunnelHealthy()
+		case "starting", "recovering":
+			// 正在重建或恢复中，给宽限 3 分钟
+			activeOK = time.Since(active.Since) < 3*time.Minute
+		}
+	}
+	if standby != nil {
+		switch standby.Status {
+		case "up":
+			standbyOK = standby.tunnelHealthy()
+		case "starting", "recovering":
+			standbyOK = time.Since(standby.Since) < 3*time.Minute
+		}
+	}
+	return
+}
+
+// refreshFailedTunnel 刷新一条故障隧道：停掉旧的，建一条新的替换。
+// 停掉前先标记为"recovering"，防止健康检查在重建期间重复触发。
+func (p *TunnelPool) refreshFailedTunnel(failed *Tunnel) {
+	oldHost := failed.Node.HostName
+	log.Printf("正在刷新隧道 %s", oldHost)
+
+	// 先标记为 recovering，让 checkTunnels 知道这条隧道正在被处理
+	// 防止健康检查在重建期间重复触发
+	failed.mu.Lock()
+	failed.Status = "recovering"
+	failed.mu.Unlock()
+
+	// 停掉旧隧道（释放 netns 和端口）
+	failed.stop()
+
+	// 重新拉取节点列表，确保有最新数据
+	if err := p.refreshNodes(); err != nil {
+		log.Printf("刷新节点列表失败: %v", err)
+	}
+
+	// 新建一条隧道
+	node, err := p.pickNode(oldHost)
 	if err != nil {
-		return false
+		log.Printf("刷新隧道失败: %v", err)
+		// 仍然尝试创建，不留空位
+		node, err = p.pickNode("")
+		if err != nil {
+			log.Printf("无可用节点，隧道将保持空置: %v", err)
+			return
+		}
 	}
-	got := strings.TrimSpace(string(out))
-	if got == "" {
-		return false
+
+	// 复用旧隧道的槽位
+	newTunnel := &Tunnel{
+		Slot:    failed.Slot,
+		Node:    node,
+		Status:  "starting",
+		Since:   time.Now(),
+		workDir: p.workDir,
 	}
-	// 出口 IP 变了说明 VPN 已经断开，流量退回了母机
-	return got == t.ExitIP
+
+	log.Printf("新隧道 %d: 正在连接 %s (%s)", newTunnel.Slot, node.HostName, node.CountryCode)
+	if err := p.bringUp(newTunnel); err != nil {
+		log.Printf("新隧道 %d 启动失败: %v", newTunnel.Slot, err)
+		// 失败后清理
+		newTunnel.stop()
+		return
+	}
+
+	log.Printf("新隧道 %d 已就绪，出口 IP: %s", newTunnel.Slot, newTunnel.ExitIP)
+	p.ReplaceTunnel(failed, newTunnel)
 }
 
-// reconnect 就地把一条隧道换到别的节点上，保持槽位与端口不变，
-// 这样已经分发出去的客户端配置仍然可用。
-//
-// oldHost 必须是本次重连前那条隧道真正绑着的节点名。调用方若已经
-// 改过 t.Node（比如手动换节点），就要把改之前的名字传进来，
-// 否则 rebind 找不到旧绑定，入站会掉成孤儿。
-func (m *Manager) reconnect(t *Tunnel, oldHost string) {
-	t.Status = "starting"
-	t.Err = "正在换节点重连"
-	t.ExitIP = ""
-
-	if t.ovpn != nil && t.ovpn.Process != nil {
-		_ = t.ovpn.Process.Kill()
-		t.ovpn = nil
+// createStandbyTunnel 创建一条备用隧道（当 standby 为 nil 时调用）。
+func (p *TunnelPool) createStandbyTunnel() {
+	// 检查是否已有备用隧道
+	p.mu.RLock()
+	alreadyHasStandby := p.standby != nil
+	activeSlot := 0
+	if p.active != nil {
+		activeSlot = p.active.Slot
 	}
-	t.teardownNetns()
+	p.mu.RUnlock()
 
-	go func() {
-		// 通知延后到 rebind/resync 之后：那两步会把入站改绑到新节点，
-		// 提前重建配置会因为入站还指着旧节点名而丢掉路由规则
-		m.bringUp(t, false)
-		if t.Status != "up" {
+	if alreadyHasStandby {
+		return
+	}
+
+	// 找可用节点
+	node, err := p.pickNode("")
+	if err != nil {
+		if err := p.refreshNodes(); err != nil {
+			log.Printf("创建备用隧道失败: %v", err)
 			return
 		}
-		// 出站 tag 跟着节点名走，换了节点就要把原来指向它的入站重新绑过去，
-		// 否则面板里的路由会指向一个已经不存在的出站。
-		if t.Node.HostName != oldHost {
-			if err := m.rebind(oldHost, t); err != nil {
-				log.Printf("重连后同步 3x-ui 绑定失败: %v", err)
-			}
+		node, err = p.pickNode("")
+		if err != nil {
+			log.Printf("创建备用隧道失败: %v", err)
 			return
 		}
-		// 节点名没变也要重写一次出站：出口 IP 可能变了，
-		// 而且上一轮换节点时留下的绑定需要重新指回来。
-		if err := m.resync(t); err != nil {
-			log.Printf("重连后重写 3x-ui 出站失败: %v", err)
-		}
-	}()
+	}
+
+	// 备用隧道用 2 号槽位（如果主隧道是 1），否则用 1
+	slot := 2
+	if activeSlot == 2 {
+		slot = 1
+	}
+
+	newTunnel := &Tunnel{
+		Slot:    slot,
+		Node:    node,
+		Status:  "starting",
+		Since:   time.Now(),
+		workDir: p.workDir,
+	}
+
+	log.Printf("创建备用隧道 %d: 正在连接 %s (%s)", slot, node.HostName, node.CountryCode)
+	if err := p.bringUp(newTunnel); err != nil {
+		log.Printf("备用隧道创建失败: %v", err)
+		newTunnel.stop()
+		return
+	}
+
+	// 替换到池中。检查是否已有 standby（防止并发）
+	p.mu.Lock()
+	if p.standby == nil {
+		p.standby = newTunnel
+		log.Printf("备用隧道已创建: %s (%s)", newTunnel.Node.HostName, newTunnel.ExitIP)
+	} else {
+		// 已被别的 goroutine 创建了，丢弃
+		newTunnel.stop()
+	}
+	p.mu.Unlock()
 }

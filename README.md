@@ -1,168 +1,179 @@
-# fanout
+# fanout-slim
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-把 VPN Gate 的公共节点变成本地 SOCKS5 端口：一个端口一个出口 IP。
-再给每个出口挂一个节点链接，客户端连哪个端口就从哪个国家出去。
+把 VPN Gate 公共节点变成本地 SOCKS5 代理，自动故障切换，双隧道高可用。
 
-节点链接有两种管法：同机装了 3x-ui 就接管面板里的入站，没装则 fanout
-自己跑 Xray，建站、改站、发链接都在同一个界面里完成。
-
-![主界面](https://images.joeyblog.net/2026/7/27/fanout-dashboard.png)
-
-四条隧道跑在一台机器上，四个端口对应四个国家的出口，母机自己的 IP 不受影响：
-
-![出口验证](https://images.joeyblog.net/2026/7/26/fanout-6-exit-ip.png)
+fanout-slim 是 [fanout](https://github.com/byJoey/fanout) 的轻量精简版：
+- **去掉 Web 管理界面**、Xray/3x-ui 集成、多出口管理
+- **保留核心**：网络命名空间隔离、双隧道自动故障切换、SOCKS5 入口
+- 加上**完善的清理机制**：父进程退出自动清理 netns 和 iptables 残留
 
 ## 原理
 
-每个节点跑在独立的 network namespace 里，netns 内启动官方 openvpn 客户端。
-SOCKS5 监听在母机，出站连接用 `setns` 切进对应 netns 建立。
+```
+客户端 ──> SOCKS5 :10000 ──> setns 切进 netns ──> openvpn ──> VPN Gate 节点
+```
 
-这样做的好处：VPN 的路由劫持只影响自己的 netns，不会切断母机的网络；
-多个节点互不干扰，各自一个出口 IP。
+每个隧道跑在独立的 network namespace 里：
+- netns 内启动官方 openvpn 客户端，连接 VPN Gate 公共节点
+- VPN 路由劫持只影响自己的 netns，不切断宿主机网络
+- SOCKS5 连接通过 `setns` 系统调用切入对应 netns 建立出站连接
+- 域名解析在隧道 netns 内用 `8.8.8.8` 完成，避免 DNS 泄漏
+
+## 架构
 
 ```
-客户端 ──> 母机 SOCKS5 :随机端口 ──> netns foN ──> openvpn ──> VPN Gate 节点
+┌─────────────────────────────────────────────────────┐
+│  TunnelPool                                         │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  主隧道 (active)   │   备用隧道 (standby)    │   │
+│  │  ┌──────────────┐  │  ┌──────────────┐      │   │
+│  │  │ netns: fo1   │  │  │ netns: fo2   │      │   │
+│  │  │ openvpn → JP │  │  │ openvpn → US │      │   │
+│  │  │ ExitIP: x.x  │  │  │ ExitIP: y.y  │      │   │
+│  │  └──────────────┘  │  └──────────────┘      │   │
+│  └──────────────────────────────────────────────┘   │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  SOCKS5 :10000                                │   │
+│  │  → 通过 GetActiveDialer() 获取主隧道拨号器    │   │
+│  │  → setns 切到 fo1 建立出站连接                │   │
+│  └──────────────────────────────────────────────┘   │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  WatchHealth (每 5 秒)                        │   │
+│  │  主隧道故障 → 切换到备用隧道 → 刷新主隧道    │   │
+│  │  备用隧道故障 → 刷新备用隧道                  │   │
+│  └──────────────────────────────────────────────┘   │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  父进程监控 (每 1 秒)                          │   │
+│  │  os.FindProcess(ppid).Signal(0) 探活          │   │
+│  │  父进程死亡 → cleanupStale() → os.Exit(0)    │   │
+│  └──────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+```
+
+## 文件结构
+
+```
+├── main.go        # 入口：启动、父进程监控、信号处理
+├── pool.go        # TunnelPool 管理：主/备用隧道、节点选取、故障切换
+├── tunnel.go      # Tunnel 实现：netns 创建销毁、openvpn 启停、出口 IP 探测
+├── netns.go       # 网络命名空间切换：setns 拨号器、DNS 解析
+├── socks5.go      # SOCKS5 协议实现：无认证 CONNECT 仅 TCP
+├── health.go      # 健康检查与故障恢复
+├── vpngate.go     # VPN Gate 节点拉取与解析（CSV + JSON 镜像）
+├── check.go       # 环境检查、清理残留、依赖检测
+└── README.md      # 本文件
 ```
 
 ## 安装
 
-需要 root，Linux（依赖 netns）。
+### 依赖
+
+- Linux（需要 `netns` 支持，内核需开启 `CONFIG_NET_NS`）
+- root 权限（创建 netns 和修改 iptables）
+- 必需命令：`ip`、`iptables`、`openvpn`、`curl`、`sysctl`
+- `/dev/net/tun` 设备（LXC 容器可能缺失）
+
+### 编译
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/fanout/main/install.sh)
+git clone https://github.com/byJoey/fanout.git
+cd fanout
+GOARCH=amd64 go build -ldflags "-X main.version=slim" -o fanout-slim-amd64 .
 ```
 
-会自动下载对应架构的预编译二进制。也可以 clone 仓库后在源码目录运行同一个脚本，
-那样会从源码编译（需要 Go 1.21+）。
-
-依赖（openvpn / curl / openssl / iproute / iptables）会按发行版自动装，
-apt、dnf、yum、pacman、apk、zypper 都认。没装 3x-ui 时还会顺带下载一份
-Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
-
-服务用 systemd 或 OpenRC 都能装，装完自动开机自启。
-
-**Alpine** 默认不带 bash，先装一下：
+### 运行
 
 ```bash
-apk add bash
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/fanout/main/install.sh)
+# 直接运行（前台）
+sudo ./fanout-slim-amd64
+
+# 或后台运行
+nohup sudo ./fanout-slim-amd64 > /var/log/fanout.log 2>&1 &
 ```
-
-另外 fanout 要在 netns 里跑 openvpn，**宿主必须放开 `/dev/net/tun`**。
-不少 LXC 小鸡没给这个权限，`ls /dev/net/tun` 不存在且 `mknod` 报
-Operation not permitted 的话，这台机器用不了，跟发行版无关。
-
-装完敲 `f` 打开管理菜单：
-
-![管理菜单](https://images.joeyblog.net/2026/7/26/fanout-7-menu.png)
-
-装完会打印管理界面地址、访问路径和口令：
-
-```
-管理界面  http://<你的IP>:8899/gwPuWHvaNr/
-访问口令  f81120ac328d11c11b
-```
-
-路径和口令都是随机生成的，分别存在 `/var/lib/fanout/basepath` 和
-`/var/lib/fanout/password`。路径不对一律返回 404，扫端口的看不到这里跑着什么。
 
 ## 使用
 
-界面以**出口**为单位：一行就是一条隧道加上挂在它上面的节点链接。
-
-点「新建出口」，选地区和数量，再选一个已有节点作模板，提交后 fanout 会并行
-拉起隧道、为每个出口复制一份节点链接并绑好，进度按目标逐条回报。原来要手点
-五步跨两栏的事，现在一次点击十几秒完成。
-
-![新建出口](https://images.joeyblog.net/2026/7/27/fanout-wizard.png)
-
-每行右侧两个按钮：换一个节点（出口 IP 变、端口不变，已分发的客户端配置不用改），
-或者停掉这个出口。
-
-点节点名进详情，可以改端口、备注、启停，管理客户端，以及改绑到别的出口：
-
-![节点详情](https://images.joeyblog.net/2026/7/27/fanout-detail.png)
-
-一个入站可以挂多套客户端凭据，分发给不同的人；每套都能单独重置，
-重置后旧链接立即失效。
-
-「导出链接」一次性拿到所有节点链接：
-
-![导出链接](https://images.joeyblog.net/2026/7/27/fanout-export.png)
-
-### 节点链接从哪来
-
-同机装了 3x-ui 就直接接管面板里的入站，面板端口、路径、API token 全自动探测，
-开了 SSL 也能识别。没装 3x-ui 时 fanout 自己跑一个 Xray，界面上多一个「新建节点」
-按钮，可以选协议（VLESS / VMess / Trojan）、传输（TCP / WebSocket / gRPC /
-HTTPUpgrade / XHTTP）和安全层（无 / TLS / REALITY）。
-
-![新建节点](https://images.joeyblog.net/2026/7/27/fanout-newnode.png)
-
-REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签的，分享链接会带上
-证书指纹让客户端固定信任。也可以填自己的证书路径。
-
-两种模式下改端口、启停、加删客户端、绑定出口的操作完全一致，用起来没有区别。
-想固定用哪种，加 `-panel 3x-ui` 或 `-panel native` 启动参数。
-
-## 运维
-
-装完后敲 `f` 打开管理菜单：启停、看日志、查隧道、改端口/口令/访问路径、更新、卸载。
-
-```
-  状态      运行中
-  版本      fanout v0.1.1
-  开机自启  enabled
-
-  管理地址  http://1.2.3.4:8899/gwPuWHvaNr/
-  访问口令  f81120ac328d11c11b
-
-   1) 启动          2) 停止
-   3) 重启          4) 查看日志
-   5) 隧道列表      6) 连接信息
-   7) 改端口        8) 改口令
-   9) 改访问路径   10) 开机自启开关
-  11) 更新         12) 卸载
-```
-
-也可以直接带参数用：
+启动后 SOCKS5 代理监听在 `0.0.0.0:10000`，无认证：
 
 ```bash
-f info       # 连接信息
-f list       # 隧道列表
-f restart    # 重启
-f log        # 跟踪日志
-f update     # 更新到最新版
-f uninstall  # 卸载
+# 通过隧道访问
+curl -x socks5://127.0.0.1:10000 http://ip.sb
+
+# 浏览器配置
+# 设置 SOCKS5 代理为 127.0.0.1:10000
 ```
 
-隧道状态存在 `/var/lib/fanout/state.json`，重启后自动恢复，端口保持不变。
+## 清理机制
 
-健康检查每 10 秒跑一次，比对出口 IP 是否还是建立隧道时那个——openvpn 挂掉后
-netns 仍能经母机 NAT 出网，只看通不通会漏判。连续两次不符就自动换节点重连，
-槽位和端口不变，原先指向它的节点链接会自动改绑过去。
+fanout-slim 有**三层清理保障**，确保不会留下 netns 或 iptables 残留：
+
+### 1. 启动时清理（`cleanupStale()`）
+程序启动时立即清理上次残留的 netns 和 iptables 规则，防止崩溃残留。
+
+### 2. 运行时监控（`os.FindProcess` 探活）
+独立 goroutine **每秒**检查父进程是否存活：
+- 父进程退出（包括 `sudo kill -9` 强杀）→ 自动调用 `cleanupStale()` → `os.Exit(0)`
+- 比传统 `PR_SET_PDEATHSIG` 更可靠，可处理 `SIGKILL` 等不可捕获信号
+
+### 3. 每节点故障清理（`teardownNetns()`）
+每次隧道节点切换或故障时，彻底清理：
+- 杀掉 openvpn 子进程
+- 卸载 netns 文件系统挂载（`syscall.Unmount`）
+- 删除 netns 绑定文件（`os.Remove`）
+- 通过 `pgrep` 回退查找残留 openvpn 进程
+- 删除 iptables MASQUERADE 和 FORWARD 规则
+
+## 隧道故障切换
+
+```
+主隧道故障
+  ├─ 备用隧道可用 → 立即切换 → 刷新原主隧道
+  └─ 备用隧道不可用 → 刷新主隧道
+
+备用隧道故障
+  └─ 刷新备用隧道
+
+备用隧道不存在
+  └─ 每 30 秒尝试创建一条
+```
+
+节点选取策略：
+1. 首选同地区节点（和故障节点同一国家）
+2. 同地区尝试 6 个节点后，不限地区轮换
+3. 每个节点按速度降序排列，优先 443 端口
+
+## 健康检查
+
+每 5 秒检查一次隧道健康：
+- **`up` 状态**：通过 curl 比对出口 IP（`http://ip.sb`），确保隧道确实在 VPN 上
+- **`starting`/`recovering` 状态**：给予 3 分钟宽限，不视为故障
+- 连续两次不符 → 自动换节点重连
+
+## 配置
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| SOCKS5 端口 | 固定监听端口 | `10000` |
+| 工作目录 | 日志、配置存储 | `/var/lib/fanout/` |
+| 健康检查间隔 | 隧道健康检查周期 | 5 秒 |
+| 备用隧道重试间隔 | 创建备用隧道失败后的重试间隔 | 30 秒 |
+| 路由探测超时 | 出口 IP 检测超时 | 30 秒 |
+| 隧道建立超时 | openvpn 连接 + tun0 等待 | 30 秒 |
+| 节点列表刷新 | 手动刷新节点列表 | 60 秒 |
 
 ## 已知限制
 
-- 只转发 TCP。SOCKS5 收到域名时在本机解析，隧道内不跑 UDP/DNS。
-- VPN Gate 是志愿者节点，有相当比例已下线或满员（`AUTH_FAILED`）。
-  启动时连不上会自动顺着同地区候选往下试，最多 6 个。
-- 管理界面只有随机路径 + 口令登录，没有 HTTPS。放公网建议前面套一层反代。
+- **只转发 TCP**。SOCKS5 收到域名时通过隧道内 `8.8.8.8` 解析，隧道内不跑 UDP/DNS
+- **VPN Gate 节点可靠性**。VPN Gate 是筑波大学的学术实验项目，有相当比例节点已下线或满员。启动时连不上会自动顺着候选节点往下试
+- **国内访问受限**。部分中国网络环境无法直连 VPN Gate 节点（219.100.37.x 被 GFW 阻断），需要在海外中转服务器上运行
 
 ## 许可
 
 [MIT](LICENSE)。
 
-节点来自 [VPN Gate](https://www.vpngate.net/)（筑波大学的学术实验项目），
-本工具只是调用其公开的节点列表并用官方 openvpn 客户端连接，不修改也不代理其服务。
-使用时请遵守 VPN Gate 的条款和你所在地的法律。
-
-## 交流
-
-- 交流群：<https://t.me/+ft-zI76oovgwNmRh>
-- 视频教程：<https://youtube.com/@joeyblog>
-- 博客：<https://joeyblog.net>
-
-用着有问题、或者想要什么功能，去群里说或提 issue。
+节点来自 [VPN Gate](https://www.vpngate.net/)（筑波大学的学术实验项目），本工具只是调用其公开的节点列表并用官方 openvpn 客户端连接，不修改也不代理其服务。使用时请遵守 VPN Gate 的条款和你所在地的法律。

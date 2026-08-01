@@ -1,29 +1,22 @@
 package main
 
 import (
-	"bytes"
-	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"time"
 )
 
-// SOCKS5 最小实现：只支持 CONNECT。
-// 域名在本进程内解析，隧道里只跑 TCP，避免依赖隧道内的 UDP/DNS。
-//
-// 认证走 RFC1929 用户名/口令。端口对公网敞开，没有口令等于谁扫到谁就能用
-// 这条家宽出口，所以凭据是必需的而不是可选项。
+// SOCKS5 最小实现：只支持 CONNECT，无认证，固定端口 10000。
+// 域名在本进程内解析，隧道里只跑 TCP。
 
 const (
 	socksVer5     = 0x05
 	authNone      = 0x00
-	authUserPass  = 0x02
-	authNoAccept  = 0xff
-	authSubVer    = 0x01
 	cmdConnect    = 0x01
 	atypIPv4      = 0x01
 	atypDomain    = 0x03
@@ -34,13 +27,32 @@ const (
 	repCmdNotSupp = 0x07
 )
 
-// serveSocks 处理一条 SOCKS5 连接。dial 决定流量从哪条链路出去。
-// cred 为 nil 时不要求认证（内部调用路径不会走到，这里只是兜底）。
-func serveSocks(client net.Conn, cred *SocksCred, dial func(network, addr string) (net.Conn, error)) {
+// StartSocksServer 启动 SOCKS5 服务，监听在固定端口 10000，无认证。
+// 所有出站连接通过 pool 的当前主隧道路由。
+func StartSocksServer(pool *TunnelPool) {
+	addr := "0.0.0.0:10000"
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("监听 SOCKS5 %s 失败: %v", addr, err)
+	}
+	log.Printf("SOCKS5 入口已启动: %s（无认证）", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleSocks(conn, pool)
+	}
+}
+
+// handleSocks 处理一条 SOCKS5 连接。
+func handleSocks(client net.Conn, pool *TunnelPool) {
 	defer client.Close()
 	_ = client.SetDeadline(time.Now().Add(30 * time.Second))
 
-	if err := socksHandshake(client, cred); err != nil {
+	// 无认证握手
+	if err := socksNoAuthHandshake(client); err != nil {
 		return
 	}
 
@@ -54,7 +66,15 @@ func serveSocks(client net.Conn, cred *SocksCred, dial func(network, addr string
 		return
 	}
 
-	remote, err := dial("tcp", addr)
+	// 获取当前主隧道的拨号器
+	dialer := pool.GetActiveDialer()
+	if dialer == nil {
+		log.Printf("主隧道不可用，拒绝连接 %s", addr)
+		socksReply(client, repHostUnre)
+		return
+	}
+
+	remote, err := dialer("tcp", addr)
 	if err != nil {
 		socksReply(client, repHostUnre)
 		return
@@ -71,8 +91,8 @@ func serveSocks(client net.Conn, cred *SocksCred, dial func(network, addr string
 	relay(client, remote)
 }
 
-// socksHandshake 完成方法协商，需要认证时接着跑一轮 RFC1929。
-func socksHandshake(c net.Conn, cred *SocksCred) error {
+// socksNoAuthHandshake 完成无认证方法协商。
+func socksNoAuthHandshake(c net.Conn) error {
 	head := make([]byte, 2)
 	if _, err := io.ReadFull(c, head); err != nil {
 		return err
@@ -84,68 +104,12 @@ func socksHandshake(c net.Conn, cred *SocksCred) error {
 	if _, err := io.ReadFull(c, methods); err != nil {
 		return err
 	}
-
-	if cred == nil || cred.User == "" {
-		_, err := c.Write([]byte{socksVer5, authNone})
-		return err
-	}
-
-	// 客户端没提用户名口令就直接拒绝，不退回无认证
-	if !bytes.ContainsRune(methods, rune(authUserPass)) {
-		_, _ = c.Write([]byte{socksVer5, authNoAccept})
-		return errors.New("客户端不支持用户名口令认证")
-	}
-	if _, err := c.Write([]byte{socksVer5, authUserPass}); err != nil {
-		return err
-	}
-	return socksAuth(c, cred)
-}
-
-// socksAuth 跑一轮 RFC1929 用户名/口令子协商。
-func socksAuth(c net.Conn, cred *SocksCred) error {
-	ver := make([]byte, 1)
-	if _, err := io.ReadFull(c, ver); err != nil {
-		return err
-	}
-	if ver[0] != authSubVer {
-		return errors.New("认证子协议版本不对")
-	}
-	user, err := readLenPrefixed(c)
-	if err != nil {
-		return err
-	}
-	pass, err := readLenPrefixed(c)
-	if err != nil {
-		return err
-	}
-
-	// 恒定时间比较，避免按字节比对泄漏口令长度与前缀
-	okUser := subtle.ConstantTimeCompare(user, []byte(cred.User)) == 1
-	okPass := subtle.ConstantTimeCompare(pass, []byte(cred.Pass)) == 1
-	if !okUser || !okPass {
-		_, _ = c.Write([]byte{authSubVer, 0x01})
-		return errors.New("用户名或口令不对")
-	}
-	_, err = c.Write([]byte{authSubVer, 0x00})
+	// 回复无认证
+	_, err := c.Write([]byte{socksVer5, authNone})
 	return err
 }
 
-// readLenPrefixed 读一个单字节长度前缀的字段。
-func readLenPrefixed(c net.Conn) ([]byte, error) {
-	l := make([]byte, 1)
-	if _, err := io.ReadFull(c, l); err != nil {
-		return nil, err
-	}
-	b := make([]byte, int(l[0]))
-	if _, err := io.ReadFull(c, b); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
 var errCmdNotSupported = errors.New("仅支持 CONNECT")
-
-// errIPv6NotSupported 表示拒绝 IPv6 目标：隧道内只有 IPv4。
 var errIPv6NotSupported = errors.New("隧道内不支持 IPv6")
 
 func socksReadRequest(c net.Conn) (string, error) {
@@ -166,7 +130,6 @@ func socksReadRequest(c net.Conn) (string, error) {
 		}
 		host = net.IP(b).String()
 	case atypIPv6:
-		// 隧道内没有 IPv6 路由，放行只会让这条连接绕开隧道
 		b := make([]byte, 16)
 		if _, err := io.ReadFull(c, b); err != nil {
 			return "", err
