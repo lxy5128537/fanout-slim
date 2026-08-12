@@ -88,14 +88,15 @@ func (p *TunnelPool) refreshFailedTunnel(failed *Tunnel) {
 	oldHost := failed.Node.HostName
 	log.Printf("正在刷新隧道 %s", oldHost)
 
-	// 先标记为 recovering，让 checkTunnels 知道这条隧道正在被处理
-	// 防止健康检查在重建期间重复触发
-	failed.mu.Lock()
-	failed.Status = "recovering"
-	failed.mu.Unlock()
-
 	// 停掉旧隧道（释放 netns 和端口）
 	failed.stop()
+
+	// stop() 会设 Status="stopped"，这里重新设回 "recovering"
+	// 防止 checkTunnels 在重建期间再次触发 refresh
+	failed.mu.Lock()
+	failed.Status = "recovering"
+	failed.Since = time.Now()
+	failed.mu.Unlock()
 
 	// 重新拉取节点列表，确保有最新数据
 	if err := p.refreshNodes(); err != nil {

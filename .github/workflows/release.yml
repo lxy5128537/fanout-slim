@@ -1,65 +1,88 @@
-name: release
+name: Build and Release
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build:
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - goarch: amd64
-          - goarch: arm64
-
+        goos: [linux]
+        goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.21'
+          cache: true
 
-      - name: 编译
+      - name: Build binary
         env:
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          VERSION="${GITHUB_REF_NAME:-dev}"
-          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-            -o fanout .
+          BINARY="fanout-slim-${{ matrix.goarch }}"
+          go build -ldflags "-X main.version=v1.0" -o "dist/$BINARY" .
+          echo "Built: dist/$BINARY"
 
-      - name: 打包
-        run: |
-          tar czf "fanout-linux-${{ matrix.goarch }}.tar.gz" \
-            fanout install.sh f.sh fanout.service README.md
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: fanout-linux-${{ matrix.goarch }}
-          path: fanout-linux-${{ matrix.goarch }}.tar.gz
+          name: fanout-slim-${{ matrix.goarch }}
+          path: dist/fanout-slim-${{ matrix.goarch }}
 
   release:
+    name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
+          path: dist
 
-      - name: 生成校验和
-        run: sha256sum fanout-linux-*.tar.gz > checksums.txt
+      - name: List artifacts
+        run: find dist -type f -exec ls -lh {} \;
 
-      - uses: softprops/action-gh-release@v2
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
+          name: fanout-slim v1.0
+          body: |
+            ## fanout-slim v1.0
+
+            VPN Gate 公共节点 SOCKS5 代理 — 双隧道自动故障切换，完整清理机制。
+
+            ### 主要特性
+            - 双隧道架构：主隧道 + 备用隧道，自动故障切换
+            - SOCKS5 代理（无认证）：`127.0.0.1:10000`
+            - 三层清理保障：启动清理、运行时探活、逐节点清理
+            - 网络命名空间隔离，不干扰宿主机网络
+            - 隧道内 DNS 解析（8.8.8.8），避免 DNS 泄漏
+
+            ### 使用
+            ```bash
+            chmod +x fanout-slim-amd64
+            sudo ./fanout-slim-amd64
+            # curl -x socks5://127.0.0.1:10000 http://ip.sb
+            ```
+
+            ### 二进制文件
+            - `fanout-slim-amd64` — Linux x86_64
+            - `fanout-slim-arm64` — Linux ARM64 (aarch64)
           files: |
-            fanout-linux-*.tar.gz
-            checksums.txt
-          generate_release_notes: true
+            dist/**/*
+          tag_name: v1.0
+          draft: false
+          prerelease: false

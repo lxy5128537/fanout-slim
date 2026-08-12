@@ -11,9 +11,6 @@ import (
 	"time"
 )
 
-// SOCKS5 最小实现：只支持 CONNECT，无认证，固定端口 10000。
-// 域名在本进程内解析，隧道里只跑 TCP。
-
 const (
 	socksVer5     = 0x05
 	authNone      = 0x00
@@ -25,12 +22,16 @@ const (
 	repGenFail    = 0x01
 	repHostUnre   = 0x04
 	repCmdNotSupp = 0x07
+
+	socksDefaultPort = 10000
 )
 
-// StartSocksServer 启动 SOCKS5 服务，监听在固定端口 10000，无认证。
-// 所有出站连接通过 pool 的当前主隧道路由。
-func StartSocksServer(pool *TunnelPool) {
-	addr := "0.0.0.0:10000"
+// StartSocksServer 启动 SOCKS5 服务，所有出站连接通过 pool 的当前主隧道路由。
+func StartSocksServer(pool *TunnelPool, port int) {
+	if port <= 0 || port > 65535 {
+		port = socksDefaultPort
+	}
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("监听 SOCKS5 %s 失败: %v", addr, err)

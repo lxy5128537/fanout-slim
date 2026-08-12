@@ -218,7 +218,7 @@ func (t *Tunnel) startOpenVPN() error {
 		"--auth-nocache",
 		"--dev", "tun0",
 		"--connect-retry-max", "3",
-		"--connect-timeout", "30",
+		"--connect-timeout", "10",
 		"--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
 		"--verb", "3",
 		"--log", logPath,
@@ -229,8 +229,8 @@ func (t *Tunnel) startOpenVPN() error {
 	t.ovpn = cmd
 	go cmd.Wait() // 回收子进程，避免僵尸
 
-	// openvpn 建好 tun0 前无法出网，这里等它就绪
-	deadline := time.Now().Add(30 * time.Second)
+	// openvpn 建好 tun0 前无法出网，这里等它就绪（10 秒超时，节点不行就换下一个）
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if out, err := exec.Command("ip", "netns", "exec", ns, "ip", "-4", "addr", "show", "tun0").Output(); err == nil {
 			if strings.Contains(string(out), "inet ") {
@@ -242,7 +242,7 @@ func (t *Tunnel) startOpenVPN() error {
 		}
 		time.Sleep(time.Second)
 	}
-	return fmt.Errorf("等待 tun0 就绪超时，详见 %s", logPath)
+	return fmt.Errorf("等待 tun0 就绪超时 (10s)，详见 %s", logPath)
 }
 
 // probeExitIP 通过隧道查询出口 IP，用于确认这条隧道确实换了 IP。

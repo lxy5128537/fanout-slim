@@ -17,13 +17,15 @@ type TunnelPool struct {
 	active           *Tunnel  // 当前活跃的主隧道
 	standby          *Tunnel  // 待命的备用隧道
 	workDir          string
+	country          string   // 指定国家代码，为空则不限
 	nodes            []Node
-	lastStandbyRetry time.Time // 上次尝试创建备用隧道的时间，用于重试间隔
+	lastStandbyRetry time.Time
+	shutdownCh       chan struct{} // 仅 Shutdown() 关闭，后台 goroutine 据此退出
 }
 
-// NewTunnelPool 创建隧道池。workDir 是工作目录，用于存放 .ovpn 配置。
-func NewTunnelPool(workDir string) *TunnelPool {
-	return &TunnelPool{workDir: workDir}
+// NewTunnelPool 创建隧道池。
+func NewTunnelPool(workDir string, country string) *TunnelPool {
+	return &TunnelPool{workDir: workDir, country: country, shutdownCh: make(chan struct{})}
 }
 
 // Init 初始化隧道池：拉取节点列表，启动两条隧道。
@@ -38,21 +40,26 @@ func (p *TunnelPool) Init() error {
 	p.nodes = nodes
 	log.Printf("已获取 %d 个节点", len(nodes))
 
-	// 启动两条隧道
+	// 主隧道同步拉起
 	t1, err := p.startTunnel(1)
 	if err != nil {
 		return fmt.Errorf("启动主隧道失败: %w", err)
 	}
 	p.active = t1
+	log.Printf("主隧道出口 IP: %s", t1.ExitIP)
 
-	t2, err := p.startTunnel(2)
-	if err != nil {
-		// 主隧道已启动，备用隧道启动失败不影响使用
-		log.Printf("警告: 启动备用隧道失败: %v", err)
-		p.standby = nil
-	} else {
+	// 备用隧道异步拉起：失败不影响主隧道和 SOCKS5
+	go func() {
+		t2, err := p.startTunnel(2)
+		if err != nil {
+			log.Printf("备用隧道启动失败: %v", err)
+			return
+		}
+		p.mu.Lock()
 		p.standby = t2
-	}
+		p.mu.Unlock()
+		log.Printf("备用隧道出口 IP: %s", t2.ExitIP)
+	}()
 
 	return nil
 }
@@ -93,9 +100,11 @@ func (p *TunnelPool) bringUp(t *Tunnel) error {
 	for _, region := range attempts {
 		candidates := p.candidatesFor(t.Node, region)
 		for i, node := range candidates {
-			// 如果 shutdown 了（p.active 被设为 nil 或其他 tunnel），立即退出
-			if p.active != nil && p.active != t {
-				return fmt.Errorf("隧道已关闭")
+			// 检查是否已整体关闭
+			select {
+			case <-p.shutdownCh:
+				return fmt.Errorf("已关闭")
+			default:
 			}
 
 			if i > 0 && p.nodeInUse(node.HostName, t.Slot) {
@@ -168,6 +177,9 @@ func (p *TunnelPool) candidatesFor(first Node, region string) []Node {
 		if region != "" && n.CountryCode != region {
 			continue
 		}
+		if p.country != "" && n.CountryCode != p.country {
+			continue
+		}
 		pool = append(pool, n)
 	}
 
@@ -223,10 +235,13 @@ func (p *TunnelPool) pickNode(exclude string) (Node, error) {
 		if used[n.HostName] {
 			continue
 		}
+		if p.country != "" && n.CountryCode != p.country {
+			continue
+		}
 		candidates = append(candidates, n)
 	}
 	if len(candidates) == 0 {
-		return Node{}, fmt.Errorf("没有可用的节点，试试重新拉取列表")
+		return Node{}, fmt.Errorf("没有可用的节点（国家 %s），试试重新拉取列表", p.country)
 	}
 	// 随机挑一个，避免总是选同一个节点
 	return candidates[rand.Intn(len(candidates))], nil
@@ -306,15 +321,16 @@ func (p *TunnelPool) Status() (activeIP, standbyIP string, activeOK, standbyOK b
 // Shutdown 清理所有隧道并释放资源。
 func (p *TunnelPool) Shutdown() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.active != nil {
 		p.active.stop()
-		p.active = nil
 	}
 	if p.standby != nil {
 		p.standby.stop()
-		p.standby = nil
 	}
+	p.active = nil
+	p.standby = nil
+	p.mu.Unlock()
+	close(p.shutdownCh) // 通知所有后台 goroutine 退出
 	// 清理可能残留的 netns 和 iptables（即使隧道未完全建立）
 	cleanupStale()
 }
