@@ -1,13 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"time"
 )
 
 const (
-	healthInterval     = 5 * time.Second
-	standbyRetryAfter  = 30 * time.Second // 备用隧道创建失败后，等多久再重试
+	healthInterval    = 30 * time.Second // 拉长检查间隔，减少误判/被墙导致的频繁重连
+	standbyRetryAfter = 30 * time.Second // 备用隧道创建失败后，等多久再重试
 )
 
 // WatchHealth 周期检查两条隧道：
@@ -19,32 +20,29 @@ func (p *TunnelPool) WatchHealth() {
 	time.Sleep(10 * time.Second)
 
 	for range time.Tick(healthInterval) {
-		activeOK, standbyOK := p.checkTunnels()
+		cActive, cStandby := p.checkTunnels()
 
-		if !activeOK {
+		// 只当真失配(探测成功但 IP 不符)才切换；探测出错/被墙不切换
+		if !cActive.Healthy && cActive.Probeable {
 			log.Printf("主隧道故障，正在切换到备用隧道")
 			if p.SwitchToStandby() {
-				// 切换成功，原主隧道（现在是备用）需要刷新
 				oldActive := p.standby // SwitchToStandby 交换了指针
 				go p.refreshFailedTunnel(oldActive)
 			} else {
-				// 备用隧道也不可用，刷新主隧道
-				active := p.active
-				if active != nil {
-					go p.refreshFailedTunnel(active)
+				tActive := p.active
+				if tActive != nil {
+					go p.refreshFailedTunnel(tActive)
 				}
 			}
 			continue
 		}
 
-		// 主隧道正常，检查备用隧道
-		if !standbyOK {
+		if !cStandby.Healthy && cStandby.Probeable {
 			standby := p.standby
 			if standby != nil {
 				log.Printf("备用隧道 %s 故障，正在刷新", standby.Node.HostName)
 				go p.refreshFailedTunnel(standby)
 			} else if time.Since(p.lastStandbyRetry) >= standbyRetryAfter {
-				// 备用隧道不存在，且距上次重试已超过间隔，重试
 				p.lastStandbyRetry = time.Now()
 				go p.createStandbyTunnel()
 			}
@@ -52,34 +50,82 @@ func (p *TunnelPool) WatchHealth() {
 	}
 }
 
+// checkResult 承载单条隧道的健康检查结论，区分"真失配"与"探测出错"。
+// - Healthy=true: 健康
+// - Healthy=false 且 Probeable=true: 探测成功但 IP 失配 → 真故障，可切换
+// - Healthy=false 且 Probeable=false: 探测源超时/被墙 → 不等于隧道坏，不切换
+type checkResult struct {
+	Healthy   bool
+	Probeable bool // 是否成功完成了一次出口探测
+}
+
 // checkTunnels 检查两条隧道的健康状况。
-// - "up" 状态的隧道：通过 curl api.ipify.org 比对出口 IP
+// - "up" 状态的隧道：通过 curl api.ipify.org 比对出口 IP(容错计数)
 // - "starting" 状态的隧道：正在重建，给 3 分钟宽限，不视为故障
 // - 其他状态（failed/stopped）：判定为故障
-func (p *TunnelPool) checkTunnels() (activeOK, standbyOK bool) {
+func (p *TunnelPool) checkTunnels() (active, standby checkResult) {
 	p.mu.RLock()
-	active := p.active
-	standby := p.standby
+	tActive := p.active
+	tStandby := p.standby
 	p.mu.RUnlock()
 
-	if active != nil {
-		switch active.Status {
+	if tActive != nil {
+		switch tActive.Status {
 		case "up":
-			activeOK = active.tunnelHealthy()
+			healthy, probed := probeTunnelHealth(tActive)
+			if probed {
+				active.Healthy = healthy
+				active.Probeable = true
+			} else {
+				// 探测源超时/被墙：不等于隧道坏，视为健康且不切换
+				active.Healthy = true
+				active.Probeable = false
+			}
 		case "starting", "recovering":
-			// 正在重建或恢复中，给宽限 3 分钟
-			activeOK = time.Since(active.Since) < 3*time.Minute
+			active.Healthy = time.Since(tActive.Since) < 3*time.Minute
+			active.Probeable = false
 		}
 	}
-	if standby != nil {
-		switch standby.Status {
+	if tStandby != nil {
+		switch tStandby.Status {
 		case "up":
-			standbyOK = standby.tunnelHealthy()
+			healthy, probed := probeTunnelHealth(tStandby)
+			if probed {
+				standby.Healthy = healthy
+				standby.Probeable = true
+			} else {
+				standby.Healthy = true
+				standby.Probeable = false
+			}
 		case "starting", "recovering":
-			standbyOK = time.Since(standby.Since) < 3*time.Minute
+			standby.Healthy = time.Since(tStandby.Since) < 3*time.Minute
+			standby.Probeable = false
 		}
 	}
 	return
+}
+
+// probeTunnelHealth 做一次出口 IP 探测并返回 (是否匹配, 是否成功完成探测)。
+// 探测源超时/被墙时 probed=false(不触发切换)；IP 失配时 probed=true 且计入失配计数。
+func probeTunnelHealth(t *Tunnel) (ok bool, probed bool) {
+	if t.Status != "up" {
+		return false, false
+	}
+	ip, err := tryIPCheckURLs(t.nsName(), healthIPURLs)
+	if err != nil || ip == "" {
+		return false, false
+	}
+	if ip == t.ExitIP {
+		t.resetMismatch()
+		return true, true
+	}
+	// 失配累积：连续 >= 阈值才判死
+	t.mu.Lock()
+	t.mismatchCnt++
+	cnt := t.mismatchCnt
+	t.Err = fmt.Sprintf("出口探测连续失配 %d/%d", cnt, healthMismatchThreshold)
+	t.mu.Unlock()
+	return cnt >= healthMismatchThreshold, true
 }
 
 // refreshFailedTunnel 刷新一条故障隧道：停掉旧的，建一条新的替换。

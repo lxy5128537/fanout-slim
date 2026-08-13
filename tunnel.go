@@ -23,13 +23,21 @@ type Tunnel struct {
 	Since   time.Time `json:"since"`
 	workDir string
 
-	ns   string
-	ovpn *exec.Cmd
-	mu   sync.Mutex
+	ns          string
+	ovpn        *exec.Cmd
+	mismatchCnt int // 连续出口探测失配次数；>= 阈值才判定隧道不健康
+	mu          sync.Mutex
 }
 
 func (t *Tunnel) nsName() string { return fmt.Sprintf("fo%d", t.Slot) }
 func (t *Tunnel) subnet() string { return fmt.Sprintf("10.99.%d", t.Slot) }
+
+// resetMismatch 探测命中(健康)时清零。
+func (t *Tunnel) resetMismatch() {
+	t.mu.Lock()
+	t.mismatchCnt = 0
+	t.mu.Unlock()
+}
 
 func run(name string, args ...string) error {
 	out, err := exec.Command(name, args...).CombinedOutput()
@@ -288,18 +296,9 @@ func tryIPCheckURLs(ns string, urls []string) (string, error) {
 	return "", fmt.Errorf("所有出口 IP 检测源均失败，最后一个: %w", lastErr)
 }
 
-// tunnelHealthy 判断隧道是否还真的走在 VPN 上。
-// 依次尝试多个出口 IP 检测源，只要有一个返回和 ExitIP 一致即视为健康。
-func (t *Tunnel) tunnelHealthy() bool {
-	if t.Status != "up" {
-		return false
-	}
-	ip, err := tryIPCheckURLs(t.nsName(), healthIPURLs)
-	if err != nil || ip == "" {
-		return false
-	}
-	return ip == t.ExitIP
-}
+// healthMismatchThreshold 连续出口探测失配阈值：只有连续多次不一致才判定
+// 隧道不健康，单次探测抖动/被墙不会触发切换，避免出口 IP 频繁跳变(风控友好)。
+const healthMismatchThreshold = 3
 
 // healthIPURLs 健康检查用的出口 IP 检测源（短超时，多源兜底）。
 var healthIPURLs = []string{
