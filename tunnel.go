@@ -54,6 +54,11 @@ func (t *Tunnel) setupNetns() error {
 	// 确保文件不存在，避免 ip netns add 的 O_EXCL 失败
 	runQuiet("rm", "-f", fmt.Sprintf("/run/netns/%s", ns))
 
+	// 确保 /run/netns 目录存在，防止 teardown 后目录丢失导致 ip netns add 失败
+	if err := os.MkdirAll("/run/netns", 0755); err != nil {
+		return fmt.Errorf("创建 /run/netns 失败: %w", err)
+	}
+
 	if err := run("ip", "netns", "add", ns); err != nil {
 		return err
 	}
@@ -167,17 +172,6 @@ func (t *Tunnel) teardownNetns() {
 		for _, pid := range pids {
 			runQuiet("kill", "-9", pid)
 		}
-		// 如果 ip netns pids 没找到（文件不存在），通过进程名找到 openvpn 进程
-		if len(pids) == 0 {
-			pidOut, _ := exec.Command("pgrep", "-f", fmt.Sprintf("openvpn.*%s", ns)).Output()
-			otherPids := strings.Fields(string(pidOut))
-			if len(otherPids) > 0 {
-				log.Printf("teardown %s: pgrep 找到 %v", ns, otherPids)
-			}
-			for _, pid := range otherPids {
-				runQuiet("kill", "-9", pid)
-			}
-		}
 		// 直接 umount + unlink，绕过 ip netns del 的问题
 		if err := syscall.Unmount(nsPath, syscall.MNT_DETACH); err != nil {
 			log.Printf("teardown %s: umount 失败: %v", ns, err)
@@ -246,46 +240,74 @@ func (t *Tunnel) startOpenVPN() error {
 }
 
 // probeExitIP 通过隧道查询出口 IP，用于确认这条隧道确实换了 IP。
+// 依次尝试多个出口 IP 检测源，覆盖国内/海外环境。
 func (t *Tunnel) probeExitIP() (string, error) {
 	// 等待几秒让隧道稳定，防止路由推送延迟
 	time.Sleep(3 * time.Second)
-	out, err := exec.Command("ip", "netns", "exec", t.nsName(),
-		"curl", "-s", "--max-time", "30", "http://ip.sb").Output()
+	ip, err := tryIPCheckURLs(t.nsName(), probeIPURLs)
 	if err != nil {
-		// 尝试备用检测服务（不同域名避免 DNS 缓存问题）
-		out2, err2 := exec.Command("ip", "netns", "exec", t.nsName(),
-			"curl", "-s", "--max-time", "15", "http://api.ipify.org").Output()
-		if err2 != nil {
-			return "", fmt.Errorf("查询出口 IP 失败: %w (备用也失败: %v)", err, err2)
-		}
-		ip := strings.TrimSpace(string(out2))
-		if net.ParseIP(ip) == nil {
-			return "", fmt.Errorf("出口 IP 返回异常: %q", ip)
-		}
-		return ip, nil
-	}
-	ip := strings.TrimSpace(string(out))
-	if net.ParseIP(ip) == nil {
-		return "", fmt.Errorf("出口 IP 返回异常: %q", ip)
+		return "", fmt.Errorf("查询出口 IP 失败: %w", err)
 	}
 	return ip, nil
 }
 
+// probeIPURLs 出口 IP 检测源列表，按优先级排列。
+// 国内/海外都至少有一个可达。
+var probeIPURLs = []string{
+	"http://ip.sb",
+	"http://api.ipify.org",
+	"http://ifconfig.me",
+	"http://ip.typotip.com",
+	"http://myip.ipip.net",
+	"http://httpbin.org/ip",
+}
+
+// tryIPCheckURLs 依次尝试多个出口 IP 检测 URL，返回第一个解析到的合法 IP。
+func tryIPCheckURLs(ns string, urls []string) (string, error) {
+	var lastErr error
+	for _, u := range urls {
+		out, err := exec.Command("ip", "netns", "exec", ns,
+			"curl", "-s", "--max-time", "10", u).Output()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ip := strings.TrimSpace(string(out))
+		// ipip.net 返回 "你的 IP: xxx.xxx.xxx.xxx 来自: xxx" 这种格式
+		for _, tok := range strings.Fields(ip) {
+			if net.ParseIP(tok) != nil {
+				return tok, nil
+			}
+		}
+		// 纯 IP 响应
+		if net.ParseIP(ip) != nil {
+			return ip, nil
+		}
+		lastErr = fmt.Errorf("%s 返回: %q", u, ip)
+	}
+	return "", fmt.Errorf("所有出口 IP 检测源均失败，最后一个: %w", lastErr)
+}
+
 // tunnelHealthy 判断隧道是否还真的走在 VPN 上。
+// 依次尝试多个出口 IP 检测源，只要有一个返回和 ExitIP 一致即视为健康。
 func (t *Tunnel) tunnelHealthy() bool {
 	if t.Status != "up" {
 		return false
 	}
-	out, err := exec.Command("ip", "netns", "exec", t.nsName(),
-		"curl", "-s", "--max-time", "10", "http://ip.sb").Output()
-	if err != nil {
+	ip, err := tryIPCheckURLs(t.nsName(), healthIPURLs)
+	if err != nil || ip == "" {
 		return false
 	}
-	got := strings.TrimSpace(string(out))
-	if got == "" {
-		return false
-	}
-	return got == t.ExitIP
+	return ip == t.ExitIP
+}
+
+// healthIPURLs 健康检查用的出口 IP 检测源（短超时，多源兜底）。
+var healthIPURLs = []string{
+	"http://ip.sb",
+	"http://api.ipify.org",
+	"http://ifconfig.me",
+	"http://ip.typotip.com",
+	"http://myip.ipip.net",
 }
 
 // cleanupConfig 清理 .ovpn 配置文件。
