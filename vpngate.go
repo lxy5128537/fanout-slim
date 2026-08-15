@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,13 +33,40 @@ var vpngateMirrors = []string{
 	"http://150.40.105.8:61446/api/iphone/",
 }
 
-// githubMirror 是 GitHub 上 VPN Gate 节点列表的 JSON 镜像（国内可访问）。
+// githubMirror 是 GitHub 上 VPN Gate 节点列表的 JSON 镜像。
 // 由 fdciabdul/Vpngate-Scraper-API 自动更新，每小时更新一次。
 const githubMirror = "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json"
 
-// vpngateIPv4 是 VPN Gate 的 IPv4 地址（备用直连，避免 DNS 返回 IPv6 导致超时）。
-// 可通过环境变量 FANOUT_VPNGATE_IP 设置，或留空自动 DNS 解析（优先 IPv4）。
-var vpngateIPv4 = ""
+// ghproxyMirror 是 ghproxy.net 加速版，国内环境默认首选。
+// ghproxy 对 raw.githubusercontent.com 的镜像在国内普遍可达，
+// 而 raw.githubusercontent.com 直连在国内通常被 GFW 挡死。
+const ghproxyMirror = "https://ghproxy.net/https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json"
+
+// defaultMirrors 默认镜像尝试顺序。
+// 国内环境：ghproxy → raw.githubusercontent.com
+// 海外环境：raw.githubusercontent.com → ghproxy
+// 用户可通过 FANOUT_MIRROR 环境变量或 --mirror flag 强制指定。
+func defaultMirrors() []string {
+	if geoClass.IsCN() {
+		return []string{ghproxyMirror, githubMirror}
+	}
+	return []string{githubMirror, ghproxyMirror}
+}
+
+// getMirrorURL 返回当前使用的镜像 URL。
+// 优先使用 FANOUT_MIRROR 环境变量（或 --mirror flag），
+// 否则用默认镜像（国内 ghproxy 优先）。
+func getMirrorURL() string {
+	if v := strings.TrimSpace(os.Getenv("FANOUT_MIRROR")); v != "" {
+		return v
+	}
+	return defaultMirrors()[0]
+}
+
+var (
+	geoClass    GeoClass // 当前运行环境（由 Detect() 设置，启动时初始化）
+	vpngateIPv4 string   // VPN Gate 的 IPv4 直连地址，通过 FANOUT_VPNGATE_IP 环境变量设置
+)
 
 // Node 是一个 VPN Gate 节点。
 type Node struct {
@@ -85,12 +113,54 @@ func portPriority(port int) int {
 }
 
 // fetchNodes 拉取并解析 VPN Gate 的节点列表。
-// 依次尝试: 官方 API → 官方镜像站轮换 → GitHub 镜像。
-// 返回的列表已按速度降序排列。
+// 按运行地区选择不同的拉取策略（见 fetchNodesCN / fetchNodesOverseas）。
 func fetchNodes(timeout time.Duration) ([]Node, error) {
+	// 允许通过环境变量强制指定探测到的 VPN Gate IPv4（备用直连）
+	vpngateIPv4 = strings.TrimSpace(os.Getenv("FANOUT_VPNGATE_IP"))
+
+	switch geoClass {
+	case GeoCN:
+		log.Printf("当前环境: 国内，使用国内优化拉取策略")
+		return fetchNodesCN(timeout)
+	case GeoOverseas:
+		log.Printf("当前环境: 海外，使用海外拉取策略")
+		return fetchNodesOverseas(timeout)
+	default:
+		// 未知时按海外处理（保守、最通用）
+		log.Printf("运行环境未知，按海外策略拉取节点")
+		return fetchNodesOverseas(timeout)
+	}
+}
+
+// fetchNodesCN 国内环境：官方 API 和官方镜像站 IP 段 150.40.105.x 均被墙，
+// 直接走 GitHub 镜像（HTTPS），超时略长以应对 GFW 干扰。
+func fetchNodesCN(timeout time.Duration) ([]Node, error) {
+	log.Println("国内策略: 跳过官方 API/镜像站（被墙），优先 GitHub 镜像")
+
+	// 首选 GitHub 镜像（国内通常可访问，走 HTTPS）
+	nodes, err := tryFetchMirror(45 * time.Second)
+	if err == nil {
+		return nodes, nil
+	}
+	log.Printf("GitHub 镜像拉取失败: %v", err)
+
+	// 兜底：尝试 HTTP 镜像站（虽然大概率被墙，但留一条路）
+	log.Println("尝试 HTTP 镜像站（国内通常失败）...")
+	for _, url := range shuffleStrings(vpngateMirrors) {
+		if nodes, err := tryFetchNodes(url, 8*time.Second); err == nil {
+			log.Printf("HTTP 镜像 %s 拉取成功（非预期，但仍可用）", url)
+			return nodes, nil
+		}
+	}
+
+	return nil, fmt.Errorf("所有节点列表源均失败（国内策略），请检查网络或代理设置")
+}
+
+// fetchNodesOverseas 海外环境：官方 API 优先，镜像轮换兜底。
+func fetchNodesOverseas(timeout time.Duration) ([]Node, error) {
 	var lastErr error
 
-	// 1. 尝试官方 API
+	// 1. 官方 API（海外直连）
 	if nodes, err := tryFetchNodes(vpngateAPI, 15*time.Second); err == nil {
 		return nodes, nil
 	} else {
@@ -98,8 +168,17 @@ func fetchNodes(timeout time.Duration) ([]Node, error) {
 		log.Printf("官方 API 失败: %v", err)
 	}
 
-	// 2. 直接尝试 GitHub 镜像（30 秒超时）—— 官方镜像站 IP 段 150.40.105.x 国内均被墙
-	log.Printf("官方 API 不可用，尝试 GitHub 镜像...")
+	// 2. 官方镜像站轮换（HTTPS 优先；镜像 URL 是 HTTP，所以这里直接用 tryFetchNodes）
+	urls := shuffleStrings(vpngateMirrors)
+	for _, url := range urls {
+		if nodes, err := tryFetchNodes(url, 10*time.Second); err == nil {
+			log.Printf("镜像 %s 拉取成功", url)
+			return nodes, nil
+		}
+	}
+	log.Println("所有镜像站均不可用，尝试 GitHub 镜像")
+
+	// 3. GitHub 镜像兜底
 	if nodes, err := tryFetchMirror(30 * time.Second); err == nil {
 		return nodes, nil
 	} else {
@@ -140,21 +219,51 @@ func tryFetchNodes(url string, timeout time.Duration) ([]Node, error) {
 }
 
 // tryFetchMirror 从 GitHub 镜像 JSON 拉取 VPN Gate 节点列表。
+// 依次尝试 defaultMirrors() 中的多个镜像源（国内 ghproxy 优先），直到成功。
 func tryFetchMirror(timeout time.Duration) ([]Node, error) {
+	// 如果用户指定了 FANOUT_MIRROR，只试它
+	userMirror := strings.TrimSpace(os.Getenv("FANOUT_MIRROR"))
+	mirrors := defaultMirrors()
+	if userMirror != "" {
+		mirrors = []string{userMirror}
+	}
+	return tryFetchMirrorList(mirrors, timeout)
+}
+
+// tryFetchMirrorList 依次尝试多个镜像源拉取节点列表，返回第一个成功的。
+func tryFetchMirrorList(mirrors []string, timeout time.Duration) ([]Node, error) {
+	var lastErr error
 	client := &http.Client{Timeout: timeout}
-	resp, err := client.Get(githubMirror)
-	if err != nil {
-		return nil, fmt.Errorf("拉取 GitHub 镜像失败: %w", err)
+	for _, url := range mirrors {
+		log.Printf("尝试镜像: %s", url)
+		resp, err := client.Get(url)
+		if err != nil {
+			lastErr = fmt.Errorf("拉取 %s 失败: %w", url, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("%s HTTP %d", url, resp.StatusCode)
+			continue
+		}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("读取 %s 失败: %w", url, err)
+			continue
+		}
+		nodes, err := parseMirrorJSON(raw)
+		if err != nil {
+			lastErr = fmt.Errorf("解析 %s 失败: %w", url, err)
+			continue
+		}
+		log.Printf("从镜像 %s 拉取成功", url)
+		return nodes, nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub 镜像 HTTP %d", resp.StatusCode)
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取 GitHub 镜像失败: %w", err)
-	}
-	return parseMirrorJSON(raw)
+	return nil, fmt.Errorf("所有镜像源均不可用")
 }
 
 // mirrorServer 对应 GitHub 镜像 JSON 中的单个服务器对象。

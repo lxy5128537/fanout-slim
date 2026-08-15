@@ -16,9 +16,25 @@ var version = "Ver1.0.0"
 var socksPort = flag.Int("p", 10000, "SOCKS5 监听端口（默认 10000）")
 var country = flag.String("c", "", "VPN 节点国家代码（如 JP/KR/US，为空则不限）")
 var daemon = flag.Bool("d", false, "Daemon 模式：不监控父进程，避免开机脚本/SSH 断开时退出")
+var geoOverride = flag.String("geo-override", "", "运行环境覆盖: cn / overseas（默认自动探测）")
+var mirrorURL = flag.String("mirror", "", "VPN Gate 节点列表 JSON 镜像 URL（默认内置，也可用 FANOUT_MIRROR 环境变量指定）")
 
 func main() {
 	flag.Parse()
+
+	// 将 --geo-override 同步到环境变量，让 geo.Detect() 能通过环境变量读取到
+	if *geoOverride != "" {
+		os.Setenv("FANOUT_GEO_OVERRIDE", *geoOverride)
+	}
+
+	// 将 --mirror 同步到环境变量，让 tryFetchMirror() 能通过 FANOUT_MIRROR 读取到
+	if *mirrorURL != "" {
+		os.Setenv("FANOUT_MIRROR", *mirrorURL)
+	}
+
+	// 探测运行环境（国内 / 海外），失败时不阻塞，按海外兜底
+	geo := Detect()
+	geoClass = geo.Class
 
 	fmt.Printf("fanout-slim v%s — 双隧道自动故障切换 SOCKS5 入口\n", version)
 

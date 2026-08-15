@@ -12,6 +12,10 @@ import (
 
 // TunnelPool 管理两条隧道：主隧道（活跃）和备用隧道（待命）。
 // 入口 SOCKS5 始终走主隧道，主隧道故障时立即切换到备用隧道。
+//
+// liveNodes 是国内环境下的"节点存活预扫描"缓存：
+// 国内环境下 90%+ 节点被 GFW 挡住，直接挑随机节点基本必死。
+// preScanLive 会对候选池做并发 TCP 443 探活，挑出真正可达的节点。
 type TunnelPool struct {
 	mu               sync.RWMutex
 	active           *Tunnel  // 当前活跃的主隧道
@@ -19,6 +23,7 @@ type TunnelPool struct {
 	workDir          string
 	country          string   // 指定国家代码，为空则不限
 	nodes            []Node
+	liveNodes        []Node   // 国内环境下预扫描出的存活节点
 	lastStandbyRetry time.Time
 	shutdownCh       chan struct{} // 仅 Shutdown() 关闭，后台 goroutine 据此退出
 }
@@ -30,6 +35,7 @@ func NewTunnelPool(workDir string, country string) *TunnelPool {
 
 // Init 初始化隧道池：拉取节点列表，启动两条隧道。
 // 先启动的成为主隧道，后启动的成为备用隧道。
+// 国内环境下会先做一次"节点存活预扫描"，挑出真正可达的节点，避免被 GFW 挡死。
 func (p *TunnelPool) Init() error {
 	// 拉取节点列表
 	log.Printf("正在拉取 VPN Gate 节点列表...")
@@ -39,6 +45,11 @@ func (p *TunnelPool) Init() error {
 	}
 	p.nodes = nodes
 	log.Printf("已获取 %d 个节点", len(nodes))
+
+	// 国内环境: 预扫描活节点池
+	if geoClass.IsCN() {
+		p.preScanAndLog()
+	}
 
 	// 主隧道同步拉起
 	t1, err := p.startTunnel(1)
@@ -62,6 +73,45 @@ func (p *TunnelPool) Init() error {
 	}()
 
 	return nil
+}
+
+// preScanAndLog 在国内环境下对候选节点做并发 TCP 443 探活。
+// 命中活节点数量 >= 2 时存入 liveNodes，供 pickNode 优先挑选。
+func (p *TunnelPool) preScanAndLog() {
+	if !geoClass.IsCN() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// 过滤 + 去重, 最多 40 个候选
+	cand := make([]Node, 0, 40)
+	seen := map[string]bool{}
+	for _, n := range p.nodes {
+		if p.country != "" && n.CountryCode != p.country {
+			continue
+		}
+		if seen[n.IP] {
+			continue
+		}
+		seen[n.IP] = true
+		cand = append(cand, n)
+		if len(cand) >= 40 {
+			break
+		}
+	}
+
+	log.Printf("国内环境: 开始对 %d 个候选节点做 TCP 443 存活预扫描（3s/节点, 50 并发）", len(cand))
+	t0 := time.Now()
+	live := preScanLive(cand, 3*time.Second, 50)
+	dt := time.Since(t0)
+	log.Printf("存活预扫描完成: 共 %d 个节点可达（耗时 %v）", len(live), dt.Round(time.Millisecond))
+	p.liveNodes = live
+
+	// 命中 >= 2 才启用; 否则保留海外式随机挑选
+	if len(live) >= 2 {
+		log.Printf("启用活节点优先策略: %d 个可用节点", len(live))
+	}
 }
 
 // startTunnel 启动一条新隧道，slot 用于区分 netns 名称。
@@ -214,6 +264,8 @@ func (p *TunnelPool) nodeInUse(host string, exceptSlot int) bool {
 }
 
 // pickNode 从节点列表中挑一个可用的节点。
+// 如果 liveNodes 有缓存（国内环境预扫描结果）且数量 >= 2，优先从 liveNodes 挑；
+// 否则走常规的随机挑选。
 // exclude 不为空时排除该主机名。
 func (p *TunnelPool) pickNode(exclude string) (Node, error) {
 	p.mu.RLock()
@@ -230,6 +282,24 @@ func (p *TunnelPool) pickNode(exclude string) (Node, error) {
 		used[exclude] = true
 	}
 
+	// 优先从 liveNodes 挑（如果存活数 >= 2 才启用）
+	if len(p.liveNodes) >= 2 {
+		var live []Node
+		for _, n := range p.liveNodes {
+			if used[n.HostName] {
+				continue
+			}
+			if p.country != "" && n.CountryCode != p.country {
+				continue
+			}
+			live = append(live, n)
+		}
+		if len(live) >= 2 {
+			return live[rand.Intn(len(live))], nil
+		}
+	}
+
+	// 走常规节点列表
 	var candidates []Node
 	for _, n := range p.nodes {
 		if used[n.HostName] {
@@ -243,11 +313,12 @@ func (p *TunnelPool) pickNode(exclude string) (Node, error) {
 	if len(candidates) == 0 {
 		return Node{}, fmt.Errorf("没有可用的节点（国家 %s），试试重新拉取列表", p.country)
 	}
-	// 随机挑一个，避免总是选同一个节点
 	return candidates[rand.Intn(len(candidates))], nil
 }
 
 // refreshNodes 重新拉取节点列表。
+// 如果运行在国内环境，会同步刷新活节点预扫描缓存，
+// 因为 GFW 拦截状态随时可能变化（旧的活节点可能已死，新的可能已通）。
 func (p *TunnelPool) refreshNodes() error {
 	nodes, err := fetchNodes(60 * time.Second)
 	if err != nil {
@@ -256,6 +327,12 @@ func (p *TunnelPool) refreshNodes() error {
 	p.mu.Lock()
 	p.nodes = nodes
 	p.mu.Unlock()
+
+	// 国内环境下重扫活节点池
+	if geoClass.IsCN() {
+		log.Println("国内环境: 节点列表已刷新，重新做存活预扫描")
+		p.preScanAndLog()
+	}
 	return nil
 }
 
@@ -333,4 +410,50 @@ func (p *TunnelPool) Shutdown() {
 	close(p.shutdownCh) // 通知所有后台 goroutine 退出
 	// 清理可能残留的 netns 和 iptables（即使隧道未完全建立）
 	cleanupStale()
+}
+
+// preScanLive 对候选节点并发做 TCP 443 端口存活探测。
+// 国内环境下 90%+ 节点被 GFW 挡死，直接挑随机节点基本必死。
+// 先快速筛出真正可达的节点，再让主/备隧道从活节点池中挑，显著降低启动失败率。
+//
+// 参数：
+//   - perTryTimeout 每个 TCP 尝试超时（建议 3s）
+//   - concurrency   并发度（<= 0 时使用默认 50）
+func preScanLive(cand []Node, perTryTimeout time.Duration, concurrency int) []Node {
+	if len(cand) == 0 {
+		return nil
+	}
+	if concurrency <= 0 {
+		concurrency = 50
+	}
+
+	type result struct{ idx int; ok bool }
+	resCh := make(chan result, len(cand))
+	sem := make(chan struct{}, concurrency)
+
+	for i, n := range cand {
+		sem <- struct{}{}
+		go func(idx int, node Node) {
+			defer func() { <-sem }()
+			ip := node.IP
+			if ip == "" {
+				resCh <- result{idx: idx, ok: false}
+				return
+			}
+			conn, err := net.DialTimeout("tcp4", net.JoinHostPort(ip, "443"), perTryTimeout)
+			resCh <- result{idx: idx, ok: err == nil}
+			if err == nil {
+				conn.Close()
+			}
+		}(i, n)
+	}
+
+	live := make([]Node, 0)
+	for range cand {
+		r := <-resCh
+		if r.ok {
+			live = append(live, cand[r.idx])
+		}
+	}
+	return live
 }
