@@ -59,12 +59,13 @@ fout 是 [fanout](https://github.com/byJoey/fanout) 的轻量精简版：
 
 ```
 ├── main.go        # 入口：参数解析、信号处理、daemon 模式
-├── pool.go        # TunnelPool：主/备用隧道、节点选取、故障切换、shutdownCh
+├── pool.go        # TunnelPool：主/备用隧道、节点选取、故障切换、活节点预扫描
 ├── tunnel.go      # Tunnel：netns 创建销毁、openvpn 启停、出口 IP 探测
 ├── netns.go       # 网络命名空间切换：setns 拨号器、DNS 解析
 ├── socks5.go      # SOCKS5 协议：无认证 CONNECT 仅 TCP，端口可配
 ├── health.go      # 健康检查与故障恢复（recovering 状态防重复 refresh）
-├── vpngate.go     # VPN Gate 节点拉取与解析（CSV + JSON 镜像）
+├── vpngate.go     # VPN Gate 节点拉取与解析（CSV + JSON 镜像 + 地理自适应）
+├── geo.go         # 本机出口 IP 地理位置探测（国内/海外自适应）
 ├── check.go       # 环境检查、清理残留、依赖检测
 └── README.md      # 本文件
 ```
@@ -103,6 +104,8 @@ nohup sudo ./fout > /var/log/fanout.log 2>&1 &
 | `-p` | `10000` | SOCKS5 监听端口 |
 | `-c` | `""` | VPN 节点国家代码（如 `JP` / `KR` / `US`），空字符串则不限国家 |
 | `-d` | `false` | Daemon 模式：不监控父进程，避免开机脚本或 SSH 断开时误退出 |
+| `--geo-override` | `""` | 运行环境覆盖：`cn`（国内）/ `overseas`（海外），默认自动探测 |
+| `--mirror` | `""` | VPN Gate 节点列表 JSON 镜像 URL（默认内置，也可用 `FANOUT_MIRROR` 环境变量指定）|
 
 ### 用法示例
 
@@ -115,6 +118,31 @@ sudo ./fout
 
 # 不加 -c 时使用全部国家节点
 sudo ./fout -d
+```
+
+### 国内环境自适应（v1.1.0+）
+
+fout 会自动探测本机出口 IP 的地理位置，据此调整节点拉取与挑选策略：
+
+| 项目 | 🇨🇳 国内环境 | 🌐 海外环境 |
+|------|-------------|-----------|
+| 节点列表拉取 | 跳过被墙的官方 API（150.40.105.x），直取 GitHub 镜像 + curl 探测兜底 | 官方 API 优先 → GitHub 镜像兜底 |
+| 节点挑选 | 先对候选节点做 TCP 443 并发存活预扫描，优先从活节点池挑选 | 常规随机挑选 |
+| DNS / 探测代理 | 可通过 `FANOUT_PROXY` 环境变量走代理探测 | 直连 |
+
+> 国内环境下 VPN Gate 官方 API 与大量节点被 GFW 阻断，自适应策略可显著降低启动失败率。
+
+**手动覆盖**：探测不准或需强制指定环境时，用 `--geo-override`：
+
+```bash
+# 强制按国内环境运行（走镜像 + 节点预扫描）
+sudo ./fout -c JP -d --geo-override cn
+
+# 指定自定义镜像 JSON URL（与 FANOUT_MIRROR 二选一即可）
+sudo ./fout --mirror https://example.com/nodes.json
+
+# 或用环境变量
+FANOUT_MIRROR=https://example.com/nodes.json FANOUT_PROXY=socks5://127.0.0.1:1080 ./fout
 ```
 
 ### 开机自启（OpenRC local.d）
@@ -216,12 +244,15 @@ fout 有**三层清理保障**，确保不会留下 netns 或 iptables 残留：
 | tun0 就绪等待 | 15 秒 | openvpn 建立后等 tun0 拿到 IP |
 | 候选节点数量 | 3 | `candidatesFor` 每次最多尝试的节点数 |
 | 节点列表刷新超时 | 60 秒 | VPN Gate API 超时 |
+| 活节点预扫描并发 | 50 | 国内环境下存活预扫描的并发度 |
+| 活节点单探测超时 | 3 秒 | 国内环境下每个候选节点 TCP 443 探测超时 |
+| 地理探测代理 | 无 | `FANOUT_PROXY` 环境变量指定，用于探测时走代理 |
 
 ## 已知限制
 
 - **只转发 TCP**。SOCKS5 收到域名时通过隧道内 `8.8.8.8` 解析，隧道内不跑 UDP/DNS
 - **VPN Gate 节点可靠性**。VPN Gate 是筑波大学的学术实验项目，有相当比例节点已下线或满员。启动时连不上会自动顺着候选节点往下试
-- **国内访问受限**。部分中国网络环境无法直连 VPN Gate 节点（219.100.37.x 被 GFW 阻断），需要在海外中转服务器上运行
+- **国内访问受限（海外环境）**。部分中国网络环境无法直连 VPN Gate 节点（219.100.37.x 被 GFW 阻断）；建议**在fout 中开启地理自适应功能**（v1.1.0+，自动走镜像 + 节点预扫描），或在海外中转服务器上运行
 
 ## 许可
 
